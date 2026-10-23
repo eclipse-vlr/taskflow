@@ -13,7 +13,7 @@ import (
 
 	"taskflow/internal/config"
 	"taskflow/internal/handler"
-	"taskflow/internal/repository/memory"
+	"taskflow/internal/repository/postgres"
 	"taskflow/internal/task"
 )
 
@@ -32,7 +32,19 @@ func run(logger *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	service := task.NewService(memory.New(cfg.TaskCapacity))
+	pool, err := postgres.Open(ctx, cfg.DatabaseURL, cfg.DBTimeout, cfg.DBMaxConns)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	// Migrations are an explicit deployment step, never a side effect of startup.
+	checkCtx, cancelCheck := context.WithTimeout(ctx, cfg.DBTimeout)
+	_, err = pool.Exec(checkCtx, "SELECT id FROM tasks LIMIT 0")
+	cancelCheck()
+	if err != nil {
+		return errors.New("task schema is unavailable; apply database migrations before starting the API")
+	}
+	service := task.NewService(postgres.New(pool, cfg.DBTimeout))
 	server := &http.Server{
 		Addr: cfg.HTTPAddr, Handler: handler.New(service, logger),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,

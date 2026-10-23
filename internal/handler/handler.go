@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -20,6 +22,7 @@ const maxBodyBytes = 16 * 1024
 type TaskService interface {
 	Create(context.Context, task.CreateInput) (task.Task, error)
 	Get(context.Context, string) (task.Task, error)
+	List(context.Context, task.ListOptions) ([]task.Task, error)
 }
 
 type Handler struct {
@@ -34,6 +37,7 @@ func New(service TaskService, logger *slog.Logger) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /api/v1/tasks", h.create)
+	mux.HandleFunc("GET /api/v1/tasks", h.list)
 	mux.HandleFunc("GET /api/v1/tasks/{id}", h.get)
 	return mux
 }
@@ -87,6 +91,43 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, found)
+}
+
+func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
+	query, err := urlQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid pagination parameters")
+		return
+	}
+	tasks, err := h.service.List(r.Context(), query)
+	if err != nil {
+		h.serviceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks, "limit": query.Limit, "offset": query.Offset})
+}
+
+func urlQuery(r *http.Request) (task.ListOptions, error) {
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return task.ListOptions{}, err
+	}
+	options := task.ListOptions{Limit: 20}
+	for name, values := range values {
+		if len(values) != 1 || (name != "limit" && name != "offset") {
+			return task.ListOptions{}, task.ErrInvalid
+		}
+		value, err := strconv.Atoi(values[0])
+		if err != nil {
+			return task.ListOptions{}, err
+		}
+		if name == "limit" {
+			options.Limit = value
+		} else {
+			options.Offset = value
+		}
+	}
+	return options, nil
 }
 
 func (h *Handler) serviceError(w http.ResponseWriter, r *http.Request, err error) {
