@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"taskflow/internal/handler"
 	"taskflow/internal/repository/memory"
@@ -175,6 +176,10 @@ func (failingService) Get(context.Context, string) (task.Task, error) {
 	return task.Task{}, errors.New("password=secret")
 }
 
+func (failingService) List(context.Context, task.ListOptions) ([]task.Task, error) {
+	return nil, errors.New("password=secret")
+}
+
 func TestInternalErrorDoesNotLeak(t *testing.T) {
 	h := handler.New(failingService{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	for _, method := range []string{http.MethodPost, http.MethodGet} {
@@ -185,6 +190,49 @@ func TestInternalErrorDoesNotLeak(t *testing.T) {
 		w := request(h, method, path, validBody, "application/json")
 		if w.Code != 500 || strings.Contains(w.Body.String(), "secret") {
 			t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+		}
+	}
+}
+
+func TestListPagination(t *testing.T) {
+	repository := memory.New(10)
+	createdAt := time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC)
+	for _, id := range []string{"a", "c", "b"} {
+		if err := repository.Create(t.Context(), task.Task{ID: id, CreatedAt: createdAt}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := handler.New(task.NewService(repository), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := request(h, http.MethodGet, "/api/v1/tasks?limit=1&offset=1", "", "")
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var page struct {
+		Tasks  []task.Task `json:"tasks"`
+		Limit  int         `json:"limit"`
+		Offset int         `json:"offset"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Limit != 1 || page.Offset != 1 || len(page.Tasks) != 1 || page.Tasks[0].ID != "b" {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+	w = request(h, http.MethodGet, "/api/v1/tasks?offset=100", "", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"tasks":[]`) {
+		t.Fatalf("expected empty array, got %d %s", w.Code, w.Body)
+	}
+	w = request(newHandler(1), http.MethodGet, "/api/v1/tasks", "", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"limit":20`) || !strings.Contains(w.Body.String(), `"tasks":[]`) {
+		t.Fatalf("unexpected default page: %d %s", w.Code, w.Body)
+	}
+	for _, query := range []string{
+		"limit=0", "limit=-1", "limit=101", "limit=abc", "limit=", "offset=-1", "offset=1000001",
+		"offset=abc", "limit=1&limit=2", "extra=1", "offset=", "limit=%zz", "limit=1;offset=2",
+	} {
+		w := request(h, http.MethodGet, "/api/v1/tasks?"+query, "", "")
+		if w.Code != 400 {
+			t.Errorf("query %q: status = %d, body = %s", query, w.Code, w.Body)
 		}
 	}
 }

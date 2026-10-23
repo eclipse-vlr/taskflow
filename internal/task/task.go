@@ -48,6 +48,12 @@ type Task struct {
 type Repository interface {
 	Create(context.Context, Task) error
 	Get(context.Context, string) (Task, error)
+	List(context.Context, ListOptions) ([]Task, error)
+}
+
+type ListOptions struct {
+	Limit  int
+	Offset int
 }
 
 type Service struct {
@@ -79,7 +85,8 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 	if err != nil {
 		return Task{}, fmt.Errorf("generate task ID: %w", err)
 	}
-	now := time.Now().UTC()
+	// PostgreSQL stores timestamps with microsecond precision.
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	created := Task{
 		ID: id, Type: input.Type, Payload: input.Payload,
 		Status: StatusPending, MaxAttempts: maxAttempts,
@@ -97,6 +104,17 @@ func (s *Service) Get(ctx context.Context, id string) (Task, error) {
 		return Task{}, fmt.Errorf("get task: %w", err)
 	}
 	return found, nil
+}
+
+func (s *Service) List(ctx context.Context, options ListOptions) ([]Task, error) {
+	if options.Limit < 1 || options.Limit > 100 || options.Offset < 0 || options.Offset > 1000000 {
+		return nil, fmt.Errorf("%w: limit must be from 1 to 100 and offset from 0 to 1000000", ErrInvalid)
+	}
+	tasks, err := s.repository.List(ctx, options)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks: %w", err)
+	}
+	return tasks, nil
 }
 
 func newID() (string, error) {
