@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -69,7 +70,8 @@ func (r *Repository) Create(ctx context.Context, created task.Task) error {
 	return operationError(ctx, "insert task", err)
 }
 
-const columns = `id::text, type, payload, status, attempts, max_attempts, created_at, updated_at`
+const columns = `t.id::text, t.type, t.payload, t.status, t.attempts, t.max_attempts,
+	t.created_at, t.updated_at, t.started_at, t.finished_at, t.result, t.last_error`
 
 func (r *Repository) Get(ctx context.Context, id string) (task.Task, error) {
 	if len(id) != 36 {
@@ -81,7 +83,7 @@ func (r *Repository) Get(ctx context.Context, id string) (task.Task, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	found, err := scanTask(r.pool.QueryRow(ctx, `SELECT `+columns+` FROM tasks WHERE id = $1`, uuid))
+	found, err := scanTask(r.pool.QueryRow(ctx, `SELECT `+columns+` FROM tasks t WHERE t.id = $1`, uuid))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task.Task{}, task.ErrNotFound
 	}
@@ -91,7 +93,7 @@ func (r *Repository) Get(ctx context.Context, id string) (task.Task, error) {
 func (r *Repository) List(ctx context.Context, options task.ListOptions) ([]task.Task, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	rows, err := r.pool.Query(ctx, `SELECT `+columns+` FROM tasks ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, options.Limit, options.Offset)
+	rows, err := r.pool.Query(ctx, `SELECT `+columns+` FROM tasks t ORDER BY t.created_at DESC, t.id DESC LIMIT $1 OFFSET $2`, options.Limit, options.Offset)
 	if err != nil {
 		return nil, operationError(ctx, "list tasks", err)
 	}
@@ -112,9 +114,77 @@ func (r *Repository) List(ctx context.Context, options task.ListOptions) ([]task
 
 func scanTask(row pgx.Row) (task.Task, error) {
 	var found task.Task
+	var startedAt, finishedAt pgtype.Timestamptz
+	var lastError pgtype.Text
+	var result []byte
 	err := row.Scan(&found.ID, &found.Type, &found.Payload, &found.Status,
-		&found.Attempts, &found.MaxAttempts, &found.CreatedAt, &found.UpdatedAt)
-	return found, err
+		&found.Attempts, &found.MaxAttempts, &found.CreatedAt, &found.UpdatedAt,
+		&startedAt, &finishedAt, &result, &lastError)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if startedAt.Valid {
+		found.StartedAt = startedAt.Time
+	}
+	if finishedAt.Valid {
+		found.FinishedAt = finishedAt.Time
+	}
+	found.LastError = lastError.String
+	if len(result) != 0 {
+		if err := json.Unmarshal(result, &found.Result); err != nil {
+			return task.Task{}, fmt.Errorf("decode task result: %w", err)
+		}
+	}
+	return found, nil
+}
+
+// ClaimNext changes one ready task to running in a single database statement.
+// SKIP LOCKED allows independent workers to claim different tasks.
+func (r *Repository) ClaimNext(ctx context.Context) (task.Task, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	claimed, err := scanTask(r.pool.QueryRow(ctx, `WITH candidate AS (
+		SELECT id FROM tasks
+		WHERE status = 'pending' AND attempts < max_attempts
+		AND (next_run_at IS NULL OR next_run_at <= clock_timestamp())
+		ORDER BY created_at, id
+		FOR UPDATE SKIP LOCKED LIMIT 1
+	)
+	UPDATE tasks t SET status = 'running', attempts = t.attempts + 1,
+		started_at = clock_timestamp(), finished_at = NULL, result = NULL,
+		last_error = NULL, updated_at = clock_timestamp()
+	FROM candidate WHERE t.id = candidate.id RETURNING `+columns))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return task.Task{}, task.ErrNoReady
+	}
+	return claimed, operationError(ctx, "claim task", err)
+}
+
+func (r *Repository) Finish(ctx context.Context, id string, attempt int, outcome task.Outcome) error {
+	if (outcome.Status != task.StatusSucceeded && outcome.Status != task.StatusFailed) ||
+		(outcome.Status == task.StatusSucceeded && (outcome.Result.DurationMS < 1 || outcome.LastError != "")) ||
+		(outcome.Status == task.StatusFailed && (outcome.LastError == "" || len(outcome.LastError) > 1024)) {
+		return task.ErrInvalid
+	}
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	var result any
+	var lastError any
+	if outcome.Status == task.StatusSucceeded {
+		result = outcome.Result
+	} else {
+		lastError = outcome.LastError
+	}
+	updated, err := r.pool.Exec(ctx, `UPDATE tasks SET status = $3, result = $4,
+		last_error = $5, finished_at = clock_timestamp(), updated_at = clock_timestamp()
+		WHERE id = $1 AND status = 'running' AND attempts = $2`, id, attempt, outcome.Status, result, lastError)
+	if err != nil {
+		return operationError(ctx, "finish task", err)
+	}
+	if updated.RowsAffected() != 1 {
+		return task.ErrConflict
+	}
+	return nil
 }
 
 func operationError(ctx context.Context, operation string, err error) error {

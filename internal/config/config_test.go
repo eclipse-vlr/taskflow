@@ -28,6 +28,8 @@ func TestLoad(t *testing.T) {
 			t.Setenv("TASKFLOW_HTTP_ADDR", tt.address)
 			t.Setenv("DATABASE_URL", "postgres://taskflow:secret@localhost/taskflow?sslmode=disable")
 			t.Setenv("TASKFLOW_DB_TIMEOUT", "3s")
+			t.Setenv("TASKFLOW_WORKERS", "4")
+			t.Setenv("TASKFLOW_POLL_INTERVAL", "500ms")
 			t.Setenv("TASKFLOW_DB_MAX_CONNS", tt.maxConns)
 			cfg, err := config.Load()
 			if (err == nil) != tt.valid {
@@ -60,6 +62,8 @@ func TestDatabaseSettings(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("TASKFLOW_HTTP_ADDR", "127.0.0.1:8080")
 			t.Setenv("TASKFLOW_DB_MAX_CONNS", "10")
+			t.Setenv("TASKFLOW_WORKERS", "4")
+			t.Setenv("TASKFLOW_POLL_INTERVAL", "500ms")
 			t.Setenv("DATABASE_URL", tt.databaseURL)
 			t.Setenv("TASKFLOW_DB_TIMEOUT", tt.timeout)
 			cfg, err := config.Load()
@@ -74,6 +78,30 @@ func TestDatabaseSettings(t *testing.T) {
 				if cfg.DatabaseURL != tt.databaseURL || cfg.DBTimeout != want || cfg.DBMaxConns != 10 {
 					t.Fatal("configuration differs from supplied settings")
 				}
+			}
+		})
+	}
+}
+
+func TestWorkerSettings(t *testing.T) {
+	for _, tt := range []struct {
+		workers, interval string
+		valid             bool
+	}{
+		{"4", "500ms", true}, {"1", "50ms", true}, {"100", "10s", true},
+		{"0", "500ms", false}, {"101", "500ms", false}, {"many", "500ms", false},
+		{"4", "49ms", false}, {"4", "11s", false}, {"4", "never", false},
+	} {
+		t.Run(tt.workers+"/"+tt.interval, func(t *testing.T) {
+			t.Setenv("TASKFLOW_HTTP_ADDR", "127.0.0.1:8080")
+			t.Setenv("DATABASE_URL", "postgres://localhost/taskflow")
+			t.Setenv("TASKFLOW_DB_TIMEOUT", "3s")
+			t.Setenv("TASKFLOW_DB_MAX_CONNS", "10")
+			t.Setenv("TASKFLOW_WORKERS", tt.workers)
+			t.Setenv("TASKFLOW_POLL_INTERVAL", tt.interval)
+			_, err := config.Load()
+			if (err == nil) != tt.valid {
+				t.Fatalf("error=%v valid=%v", err, tt.valid)
 			}
 		})
 	}

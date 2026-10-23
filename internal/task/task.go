@@ -22,9 +22,15 @@ var (
 	ErrInvalid  = errors.New("invalid task")
 	ErrNotFound = errors.New("task not found")
 	ErrCapacity = errors.New("task capacity reached")
+	ErrNoReady  = errors.New("no task ready for execution")
+	ErrConflict = errors.New("task state conflict")
 )
 
 type SleepPayload struct {
+	DurationMS int `json:"duration_ms"`
+}
+
+type SleepResult struct {
 	DurationMS int `json:"duration_ms"`
 }
 
@@ -43,6 +49,16 @@ type Task struct {
 	MaxAttempts int          `json:"max_attempts"`
 	CreatedAt   time.Time    `json:"created_at"`
 	UpdatedAt   time.Time    `json:"updated_at"`
+	StartedAt   time.Time    `json:"started_at,omitzero"`
+	FinishedAt  time.Time    `json:"finished_at,omitzero"`
+	Result      SleepResult  `json:"result,omitzero"`
+	LastError   string       `json:"last_error,omitempty"`
+}
+
+type Outcome struct {
+	Status    Status
+	Result    SleepResult
+	LastError string
 }
 
 type Repository interface {
