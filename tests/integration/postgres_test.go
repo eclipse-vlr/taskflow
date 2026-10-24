@@ -132,6 +132,40 @@ func TestPersistenceAcrossPools(t *testing.T) {
 	}
 }
 
+func TestGetUUIDValidation(t *testing.T) {
+	db := newDatabase(t)
+	repository := postgres.New(db.pool, time.Second)
+	created := createTask(t, repository)
+	for _, id := range []string{created.ID, strings.ToUpper(created.ID)} {
+		found, err := repository.Get(t.Context(), id)
+		if err != nil || found.ID != created.ID {
+			t.Fatalf("get valid UUID %q = %q, %v", id, found.ID, err)
+		}
+	}
+	type invalidID struct {
+		name string
+		id   string
+	}
+	invalidIDs := []invalidID{
+		{"missing separators", strings.ReplaceAll(created.ID, "-", "")},
+		{"all separators replaced", strings.ReplaceAll(created.ID, "-", "z")},
+		{"invalid hex", "z" + created.ID[1:]},
+		{"extra character", created.ID + "0"},
+	}
+	for _, position := range []int{8, 13, 18, 23} {
+		invalidIDs = append(invalidIDs, invalidID{
+			fmt.Sprintf("separator at %d", position), created.ID[:position] + "z" + created.ID[position+1:],
+		})
+	}
+	for _, test := range invalidIDs {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := repository.Get(t.Context(), test.id); !errors.Is(err, task.ErrNotFound) {
+				t.Fatalf("get malformed UUID %q: got %v, want ErrNotFound", test.id, err)
+			}
+		})
+	}
+}
+
 func TestListAndConstraints(t *testing.T) {
 	db := newDatabase(t)
 	repository := postgres.New(db.pool, time.Second)

@@ -10,14 +10,17 @@ import (
 )
 
 type Config struct {
-	HTTPAddr    string
-	DatabaseURL string
-	DBTimeout   time.Duration
-	DBMaxConns  int32
+	HTTPAddr     string
+	DatabaseURL  string
+	DBTimeout    time.Duration
+	DBMaxConns   int32
+	WorkerCount  int
+	PollInterval time.Duration
 }
 
 func Load() (Config, error) {
-	cfg := Config{HTTPAddr: "127.0.0.1:8080", DBTimeout: 3 * time.Second, DBMaxConns: 10}
+	cfg := Config{HTTPAddr: "127.0.0.1:8080", DBTimeout: 3 * time.Second, DBMaxConns: 10,
+		WorkerCount: 4, PollInterval: 500 * time.Millisecond}
 	if value, ok := os.LookupEnv("TASKFLOW_HTTP_ADDR"); ok {
 		cfg.HTTPAddr = value
 	}
@@ -47,6 +50,20 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("TASKFLOW_DB_MAX_CONNS must be from 1 to 50")
 		}
 		cfg.DBMaxConns = int32(maxConns)
+	}
+	if value, ok := os.LookupEnv("TASKFLOW_WORKERS"); ok {
+		count, err := strconv.Atoi(value)
+		if err != nil || count < 1 || count > 100 {
+			return Config{}, fmt.Errorf("TASKFLOW_WORKERS must be from 1 to 100")
+		}
+		cfg.WorkerCount = count
+	}
+	if value, ok := os.LookupEnv("TASKFLOW_POLL_INTERVAL"); ok {
+		interval, err := time.ParseDuration(value)
+		if err != nil || interval < 50*time.Millisecond || interval > 10*time.Second {
+			return Config{}, fmt.Errorf("TASKFLOW_POLL_INTERVAL must be from 50ms to 10s")
+		}
+		cfg.PollInterval = interval
 	}
 	return cfg, nil
 }

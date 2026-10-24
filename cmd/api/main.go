@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,7 +15,9 @@ import (
 	"taskflow/internal/config"
 	"taskflow/internal/handler"
 	"taskflow/internal/repository/postgres"
+	"taskflow/internal/scheduler"
 	"taskflow/internal/task"
+	"taskflow/internal/worker"
 )
 
 func main() {
@@ -44,34 +47,58 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("task schema is unavailable; apply database migrations before starting the API")
 	}
-	service := task.NewService(postgres.New(pool, cfg.DBTimeout))
+	repository := postgres.New(pool, cfg.DBTimeout)
+	service := task.NewService(repository)
+	source, err := scheduler.New(repository, cfg.PollInterval, logger)
+	if err != nil {
+		return err
+	}
+	workers, err := worker.New(cfg.WorkerCount, source, repository, worker.Sleep, cfg.DBTimeout+time.Second, logger)
+	if err != nil {
+		return err
+	}
 	server := &http.Server{
 		Addr: cfg.HTTPAddr, Handler: handler.New(service, logger),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 16 * 1024,
 	}
-	serverErrors := make(chan error, 1)
-	go func() { serverErrors <- server.ListenAndServe() }()
-	logger.Info("HTTP server starting", "address", cfg.HTTPAddr)
+	listener, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("listen HTTP: %w", err)
+	}
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
+	// Each runner sends exactly once. The owner drains both results on shutdown.
+	results := make(chan error, 2)
+	go func() { results <- server.Serve(listener) }()
+	go func() { results <- workers.Run(workerCtx) }()
+	logger.Info("HTTP server and workers started", "address", cfg.HTTPAddr, "workers", cfg.WorkerCount)
+	completed := 0
+	var runErr error
 	select {
-	case err := <-serverErrors:
+	case err := <-results:
+		completed++
 		if !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("serve HTTP: %w", err)
+			runErr = err
 		}
-		return nil
 	case <-ctx.Done():
 	}
+	cancelWorkers()
 	stop()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		_ = server.Close()
-		return fmt.Errorf("shutdown HTTP: %w", err)
+		runErr = errors.Join(runErr, fmt.Errorf("shutdown HTTP: %w", err))
 	}
-	if err := <-serverErrors; !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("serve HTTP: %w", err)
+	for completed < 2 {
+		err := <-results
+		completed++
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			runErr = errors.Join(runErr, err)
+		}
 	}
-	logger.Info("HTTP server stopped")
-	return nil
+	logger.Info("HTTP server and workers stopped")
+	return runErr
 }
