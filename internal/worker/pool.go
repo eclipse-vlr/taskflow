@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"taskflow/internal/task"
 )
@@ -69,15 +71,38 @@ func (p *Pool) runWorker(ctx context.Context) error {
 			}
 			return fmt.Errorf("get next task: %w", err)
 		}
-		result, executionErr := p.execute(ctx, claimed)
+		// Sleep is bounded by 60s. The 65s execution deadline leaves room to
+		// persist the result before the database's fixed 90s lease expires.
+		executeCtx, cancelExecute := context.WithTimeout(ctx, 65*time.Second)
+		result, executionErr := p.execute(executeCtx, claimed)
+		cancelExecute()
 		outcome := task.Outcome{Status: task.StatusSucceeded, Result: result}
 		if executionErr != nil {
-			outcome = task.Outcome{Status: task.StatusFailed, LastError: executionErr.Error()}
+			message := strings.ToValidUTF8(executionErr.Error(), "\uFFFD")
+			if len(message) > 1024 {
+				message = message[:1024]
+				for !utf8.ValidString(message) {
+					message = message[:len(message)-1]
+				}
+			}
+			if message == "" {
+				message = "task execution failed"
+			}
+			outcome = task.Outcome{Status: task.StatusFailed, LastError: message}
+			if claimed.Attempts < claimed.MaxAttempts {
+				outcome.Status = task.StatusPending
+				outcome.RetryDelay = task.RetryDelay(claimed.Attempts)
+			}
 		}
+		outcome.ExecutionID = claimed.ExecutionID
 		// State persistence outlives process cancellation, but has its own bound.
 		finishCtx, cancel := context.WithTimeout(context.Background(), p.finishTimeout)
 		err = p.finisher.Finish(finishCtx, claimed.ID, claimed.Attempts, outcome)
 		cancel()
+		if errors.Is(err, task.ErrConflict) {
+			p.logger.Warn("execution lease lost; result discarded", "task_id", claimed.ID, "attempt", claimed.Attempts)
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("persist execution of task %s: %w", claimed.ID, err)
 		}

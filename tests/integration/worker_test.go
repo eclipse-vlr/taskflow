@@ -99,7 +99,7 @@ func TestConcurrentClaimsSkipLockedRows(t *testing.T) {
 	if _, err := repository.ClaimNext(t.Context()); !errors.Is(err, task.ErrNoReady) {
 		t.Fatalf("running or future task was claimed: %v", err)
 	}
-	success := task.Outcome{Status: task.StatusSucceeded, Result: task.SleepResult{DurationMS: 1000}}
+	success := task.Outcome{Status: task.StatusSucceeded, Result: task.SleepResult{DurationMS: 1000}, ExecutionID: current.ExecutionID}
 	if err := repository.Finish(t.Context(), current.ID, current.Attempts+1, success); !errors.Is(err, task.ErrConflict) {
 		t.Fatalf("stale completion returned %v", err)
 	}
@@ -125,7 +125,7 @@ func TestWorkerPipelinePersistsOutcomes(t *testing.T) {
 		}
 	}
 	broken := createTask(t, repository)
-	if _, err := db.pool.Exec(t.Context(), "UPDATE tasks SET type = 'unsupported' WHERE id = $1", broken.ID); err != nil {
+	if _, err := db.pool.Exec(t.Context(), "UPDATE tasks SET type = 'unsupported', max_attempts = 1 WHERE id = $1", broken.ID); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -169,7 +169,7 @@ func TestWorkerShutdownPersistsInterruptedTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored, err := repository.Get(t.Context(), created.ID)
-	if err != nil || stored.Status != task.StatusFailed || stored.LastError != context.Canceled.Error() || stored.Attempts != 1 || stored.FinishedAt.IsZero() {
+	if err != nil || stored.Status != task.StatusPending || stored.LastError != context.Canceled.Error() || stored.Attempts != 1 || !stored.FinishedAt.IsZero() || stored.NextRunAt.IsZero() || stored.ExecutionID != "" {
 		t.Fatalf("interrupted task: %+v, %v", stored, err)
 	}
 }

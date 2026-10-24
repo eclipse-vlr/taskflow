@@ -90,11 +90,27 @@ func newDatabase(t *testing.T) *database {
 
 func migrationSQL(t *testing.T, direction string) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "migrations", "000001_create_tasks."+direction+".sql"))
+	paths, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*."+direction+".sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(data)
+	if len(paths) == 0 {
+		t.Fatal("no migration files")
+	}
+	slices.Sort(paths)
+	if direction == "down" {
+		slices.Reverse(paths)
+	}
+	var sql strings.Builder
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sql.Write(data)
+		sql.WriteByte('\n')
+	}
+	return sql.String()
 }
 
 func createTask(t *testing.T, repository task.Repository) task.Task {
@@ -191,6 +207,9 @@ func TestListAndConstraints(t *testing.T) {
 		"UPDATE tasks SET attempts = -1",
 		"UPDATE tasks SET max_attempts = 0",
 		"UPDATE tasks SET payload = 'null'::jsonb",
+		"UPDATE tasks SET status = 'running'",
+		"UPDATE tasks SET execution_id = gen_random_uuid()",
+		"UPDATE tasks SET lease_expires_at = clock_timestamp()",
 	} {
 		_, err := db.pool.Exec(t.Context(), sql)
 		var pgError *pgconn.PgError

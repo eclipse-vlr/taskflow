@@ -71,14 +71,12 @@ func (r *Repository) Create(ctx context.Context, created task.Task) error {
 }
 
 const columns = `t.id::text, t.type, t.payload, t.status, t.attempts, t.max_attempts,
-	t.created_at, t.updated_at, t.started_at, t.finished_at, t.result, t.last_error`
+	t.created_at, t.updated_at, t.started_at, t.finished_at, t.result, t.last_error,
+	t.next_run_at, COALESCE(t.execution_id::text, ''), t.lease_expires_at`
 
 func (r *Repository) Get(ctx context.Context, id string) (task.Task, error) {
-	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
-		return task.Task{}, task.ErrNotFound
-	}
 	var uuid pgtype.UUID
-	if err := uuid.Scan(id); err != nil {
+	if !validID(id) || uuid.Scan(id) != nil {
 		return task.Task{}, task.ErrNotFound
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -114,12 +112,12 @@ func (r *Repository) List(ctx context.Context, options task.ListOptions) ([]task
 
 func scanTask(row pgx.Row) (task.Task, error) {
 	var found task.Task
-	var startedAt, finishedAt pgtype.Timestamptz
+	var startedAt, finishedAt, nextRunAt, leaseExpiresAt pgtype.Timestamptz
 	var lastError pgtype.Text
 	var result []byte
 	err := row.Scan(&found.ID, &found.Type, &found.Payload, &found.Status,
 		&found.Attempts, &found.MaxAttempts, &found.CreatedAt, &found.UpdatedAt,
-		&startedAt, &finishedAt, &result, &lastError)
+		&startedAt, &finishedAt, &result, &lastError, &nextRunAt, &found.ExecutionID, &leaseExpiresAt)
 	if err != nil {
 		return task.Task{}, err
 	}
@@ -130,6 +128,12 @@ func scanTask(row pgx.Row) (task.Task, error) {
 		found.FinishedAt = finishedAt.Time
 	}
 	found.LastError = lastError.String
+	if nextRunAt.Valid {
+		found.NextRunAt = nextRunAt.Time
+	}
+	if leaseExpiresAt.Valid {
+		found.LeaseExpiresAt = leaseExpiresAt.Time
+	}
 	if len(result) != 0 {
 		if err := json.Unmarshal(result, &found.Result); err != nil {
 			return task.Task{}, fmt.Errorf("decode task result: %w", err)
@@ -152,7 +156,9 @@ func (r *Repository) ClaimNext(ctx context.Context) (task.Task, error) {
 	)
 	UPDATE tasks t SET status = 'running', attempts = t.attempts + 1,
 		started_at = clock_timestamp(), finished_at = NULL, result = NULL,
-		last_error = NULL, updated_at = clock_timestamp()
+		next_run_at = NULL, execution_id = gen_random_uuid(),
+		lease_expires_at = clock_timestamp() + interval '90 seconds',
+		updated_at = clock_timestamp()
 	FROM candidate WHERE t.id = candidate.id RETURNING `+columns))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task.Task{}, task.ErrNoReady
@@ -161,9 +167,10 @@ func (r *Repository) ClaimNext(ctx context.Context) (task.Task, error) {
 }
 
 func (r *Repository) Finish(ctx context.Context, id string, attempt int, outcome task.Outcome) error {
-	if (outcome.Status != task.StatusSucceeded && outcome.Status != task.StatusFailed) ||
+	if (outcome.Status != task.StatusSucceeded && outcome.Status != task.StatusFailed && outcome.Status != task.StatusPending) ||
 		(outcome.Status == task.StatusSucceeded && (outcome.Result.DurationMS < 1 || outcome.LastError != "")) ||
-		(outcome.Status == task.StatusFailed && (outcome.LastError == "" || len(outcome.LastError) > 1024)) {
+		(outcome.Status != task.StatusSucceeded && (outcome.LastError == "" || len(outcome.LastError) > 1024)) ||
+		(outcome.Status == task.StatusPending && (outcome.RetryDelay < time.Second || outcome.RetryDelay > 30*time.Second)) {
 		return task.ErrInvalid
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -176,8 +183,12 @@ func (r *Repository) Finish(ctx context.Context, id string, attempt int, outcome
 		lastError = outcome.LastError
 	}
 	updated, err := r.pool.Exec(ctx, `UPDATE tasks SET status = $3, result = $4,
-		last_error = $5, finished_at = clock_timestamp(), updated_at = clock_timestamp()
-		WHERE id = $1 AND status = 'running' AND attempts = $2`, id, attempt, outcome.Status, result, lastError)
+		last_error = $5, finished_at = CASE WHEN $3 = 'pending' THEN NULL ELSE clock_timestamp() END,
+		next_run_at = CASE WHEN $3 = 'pending' THEN clock_timestamp() + $7::bigint * interval '1 millisecond' ELSE NULL END,
+		execution_id = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+		WHERE id = $1 AND status = 'running' AND attempts = $2 AND execution_id::text = $6
+		AND lease_expires_at > clock_timestamp() AND ($3 <> 'pending' OR attempts < max_attempts)`,
+		id, attempt, outcome.Status, result, lastError, outcome.ExecutionID, outcome.RetryDelay.Milliseconds())
 	if err != nil {
 		return operationError(ctx, "finish task", err)
 	}
