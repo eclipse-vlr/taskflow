@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode/utf8"
 
 	"taskflow/internal/task"
 	"taskflow/internal/worker"
@@ -111,7 +113,7 @@ func TestPoolPersistsFailureAndCancellation(t *testing.T) {
 				var calls atomic.Int32
 				source := sourceFunc(func(ctx context.Context) (task.Task, error) {
 					if calls.Add(1) == 1 {
-						return task.Task{ID: "one", Attempts: 1}, nil
+						return task.Task{ID: "one", Attempts: 1, MaxAttempts: 1}, nil
 					}
 					<-ctx.Done()
 					return task.Task{}, ctx.Err()
@@ -167,6 +169,92 @@ func TestPoolStopsOnPersistenceError(t *testing.T) {
 		}
 		if err := pool.Run(t.Context()); !errors.Is(err, failure) {
 			t.Fatalf("persistence failure returned %v", err)
+		}
+	})
+}
+
+func TestPoolSchedulesRetryAndBoundsError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		source := sourceFunc(func(context.Context) (task.Task, error) {
+			return task.Task{ID: "one", Attempts: 2, MaxAttempts: 3, ExecutionID: "token"}, nil
+		})
+		finish := finishFunc(func(ctx context.Context, _ string, _ int, outcome task.Outcome) error {
+			if ctx.Err() != nil || outcome.Status != task.StatusPending || outcome.RetryDelay != 2*time.Second || outcome.ExecutionID != "token" || len(outcome.LastError) > 1024 || !utf8.ValidString(outcome.LastError) {
+				t.Errorf("invalid retry outcome: %+v", outcome)
+			}
+			cancel()
+			return nil
+		})
+		execute := func(context.Context, task.Task) (task.SleepResult, error) {
+			return task.SleepResult{}, errors.New(strings.Repeat("€", 1000))
+		}
+		pool, err := worker.New(1, source, finish, execute, time.Second, logger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPoolDiscardsStaleResult(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		calls := 0
+		source := sourceFunc(func(context.Context) (task.Task, error) {
+			calls++
+			if calls == 2 {
+				cancel()
+				return task.Task{}, context.Canceled
+			}
+			return task.Task{ID: "one", Attempts: 1, MaxAttempts: 1}, nil
+		})
+		finish := finishFunc(func(context.Context, string, int, task.Outcome) error { return task.ErrConflict })
+		execute := func(context.Context, task.Task) (task.SleepResult, error) {
+			return task.SleepResult{DurationMS: 1}, nil
+		}
+		pool, err := worker.New(1, source, finish, execute, time.Second, logger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.Run(ctx); err != nil || calls != 2 {
+			t.Fatalf("lost lease stopped pool: %v, calls=%d", err, calls)
+		}
+	})
+}
+
+func TestPoolBoundsExecutionBeforeLeaseExpires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		source := sourceFunc(func(context.Context) (task.Task, error) {
+			return task.Task{ID: "one", Attempts: 1, MaxAttempts: 2}, nil
+		})
+		execute := func(ctx context.Context, _ task.Task) (task.SleepResult, error) {
+			<-ctx.Done()
+			return task.SleepResult{}, ctx.Err()
+		}
+		finish := finishFunc(func(ctx context.Context, _ string, _ int, outcome task.Outcome) error {
+			if ctx.Err() != nil || outcome.Status != task.StatusPending || outcome.LastError != context.DeadlineExceeded.Error() {
+				t.Errorf("execution timeout not persisted: %+v, %v", outcome, ctx.Err())
+			}
+			cancel()
+			return nil
+		})
+		pool, err := worker.New(1, source, finish, execute, time.Second, logger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		if err := pool.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if elapsed := time.Since(started); elapsed != 65*time.Second {
+			t.Fatalf("execution deadline = %s", elapsed)
 		}
 	})
 }

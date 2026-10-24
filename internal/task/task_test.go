@@ -4,10 +4,25 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"taskflow/internal/repository/memory"
 	"taskflow/internal/task"
 )
+
+func TestRetryDelay(t *testing.T) {
+	for _, test := range []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, time.Second}, {1, time.Second}, {2, 2 * time.Second}, {5, 16 * time.Second},
+		{6, 30 * time.Second}, {10, 30 * time.Second}, {1000000, 30 * time.Second},
+	} {
+		if got := task.RetryDelay(test.attempt); got != test.want {
+			t.Errorf("delay(%d) = %s, want %s", test.attempt, got, test.want)
+		}
+	}
+}
 
 func TestCreateBoundaries(t *testing.T) {
 	for _, tt := range []struct {

@@ -41,30 +41,37 @@ type CreateInput struct {
 }
 
 type Task struct {
-	ID          string       `json:"id"`
-	Type        string       `json:"type"`
-	Payload     SleepPayload `json:"payload"`
-	Status      Status       `json:"status"`
-	Attempts    int          `json:"attempts"`
-	MaxAttempts int          `json:"max_attempts"`
-	CreatedAt   time.Time    `json:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at"`
-	StartedAt   time.Time    `json:"started_at,omitzero"`
-	FinishedAt  time.Time    `json:"finished_at,omitzero"`
-	Result      SleepResult  `json:"result,omitzero"`
-	LastError   string       `json:"last_error,omitempty"`
+	ID             string       `json:"id"`
+	Type           string       `json:"type"`
+	Payload        SleepPayload `json:"payload"`
+	Status         Status       `json:"status"`
+	Attempts       int          `json:"attempts"`
+	MaxAttempts    int          `json:"max_attempts"`
+	CreatedAt      time.Time    `json:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at"`
+	StartedAt      time.Time    `json:"started_at,omitzero"`
+	FinishedAt     time.Time    `json:"finished_at,omitzero"`
+	Result         SleepResult  `json:"result,omitzero"`
+	LastError      string       `json:"last_error,omitempty"`
+	NextRunAt      time.Time    `json:"next_run_at,omitzero"`
+	ExecutionID    string       `json:"-"`
+	LeaseExpiresAt time.Time    `json:"-"`
 }
 
 type Outcome struct {
-	Status    Status
-	Result    SleepResult
-	LastError string
+	Status      Status
+	Result      SleepResult
+	LastError   string
+	ExecutionID string
+	RetryDelay  time.Duration
 }
 
 type Repository interface {
 	Create(context.Context, Task) error
 	Get(context.Context, string) (Task, error)
 	List(context.Context, ListOptions) ([]Task, error)
+	Retry(context.Context, string) (Task, error)
+	Cancel(context.Context, string) (Task, error)
 }
 
 type ListOptions struct {
@@ -131,6 +138,30 @@ func (s *Service) List(ctx context.Context, options ListOptions) ([]Task, error)
 		return nil, fmt.Errorf("list tasks: %w", err)
 	}
 	return tasks, nil
+}
+
+// RetryDelay bounds exponential backoff independently of the attempt budget.
+func RetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	return min(time.Second<<min(attempt-1, 5), 30*time.Second)
+}
+
+func (s *Service) Retry(ctx context.Context, id string) (Task, error) {
+	updated, err := s.repository.Retry(ctx, id)
+	if err != nil {
+		return Task{}, fmt.Errorf("retry task: %w", err)
+	}
+	return updated, nil
+}
+
+func (s *Service) Cancel(ctx context.Context, id string) (Task, error) {
+	updated, err := s.repository.Cancel(ctx, id)
+	if err != nil {
+		return Task{}, fmt.Errorf("cancel task: %w", err)
+	}
+	return updated, nil
 }
 
 func newID() (string, error) {

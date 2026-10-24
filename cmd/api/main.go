@@ -42,12 +42,17 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 	// Migrations are an explicit deployment step, never a side effect of startup.
 	checkCtx, cancelCheck := context.WithTimeout(ctx, cfg.DBTimeout)
-	_, err = pool.Exec(checkCtx, "SELECT id FROM tasks LIMIT 0")
+	_, err = pool.Exec(checkCtx, "SELECT id, execution_id, lease_expires_at FROM tasks LIMIT 0")
 	cancelCheck()
 	if err != nil {
 		return errors.New("task schema is unavailable; apply database migrations before starting the API")
 	}
 	repository := postgres.New(pool, cfg.DBTimeout)
+	if count, err := repository.RecoverExpired(ctx); err != nil {
+		return fmt.Errorf("recover tasks on startup: %w", err)
+	} else if count > 0 {
+		logger.Info("tasks recovered on startup", "count", count)
+	}
 	service := task.NewService(repository)
 	source, err := scheduler.New(repository, cfg.PollInterval, logger)
 	if err != nil {
@@ -69,10 +74,11 @@ func run(logger *slog.Logger) error {
 	}
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
-	// Each runner sends exactly once. The owner drains both results on shutdown.
-	results := make(chan error, 2)
+	// Each runner sends exactly once. The owner joins all three on shutdown.
+	results := make(chan error, 3)
 	go func() { results <- server.Serve(listener) }()
 	go func() { results <- workers.Run(workerCtx) }()
+	go func() { results <- scheduler.RunRecovery(workerCtx, repository, time.Second, logger) }()
 	logger.Info("HTTP server and workers started", "address", cfg.HTTPAddr, "workers", cfg.WorkerCount)
 	completed := 0
 	var runErr error
@@ -92,7 +98,7 @@ func run(logger *slog.Logger) error {
 		_ = server.Close()
 		runErr = errors.Join(runErr, fmt.Errorf("shutdown HTTP: %w", err))
 	}
-	for completed < 2 {
+	for completed < 3 {
 		err := <-results
 		completed++
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
