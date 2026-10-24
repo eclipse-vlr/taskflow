@@ -1,0 +1,50 @@
+name: Go checks
+
+on:
+  push:
+    branches: [main, 'feature/**', 'fix/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.26.x', '1.27.x']
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: taskflow_ci
+          POSTGRES_DB: taskflow_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U taskflow -d taskflow_ci"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://taskflow:taskflow_ci@127.0.0.1:5432/taskflow_ci?sslmode=disable
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Formatting
+        run: test -z "$(gofmt -l cmd internal tests)"
+      - run: go test ./...
+      - run: go test -race -count=1 -tags=integration ./...
+      - run: go vet -tags=integration ./...
+      - run: go mod verify
