@@ -23,6 +23,8 @@ type TaskService interface {
 	Create(context.Context, task.CreateInput) (task.Task, error)
 	Get(context.Context, string) (task.Task, error)
 	List(context.Context, task.ListOptions) ([]task.Task, error)
+	Retry(context.Context, string) (task.Task, error)
+	Cancel(context.Context, string) (task.Task, error)
 }
 
 type Handler struct {
@@ -39,6 +41,8 @@ func New(service TaskService, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/v1/tasks", h.create)
 	mux.HandleFunc("GET /api/v1/tasks", h.list)
 	mux.HandleFunc("GET /api/v1/tasks/{id}", h.get)
+	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", h.retry)
+	mux.HandleFunc("POST /api/v1/tasks/{id}/cancel", h.cancel)
 	return mux
 }
 
@@ -107,6 +111,53 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks, "limit": query.Limit, "offset": query.Offset})
 }
 
+func (h *Handler) retry(w http.ResponseWriter, r *http.Request) {
+	h.transition(w, r, true)
+}
+
+func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
+	h.transition(w, r, false)
+}
+
+func (h *Handler) transition(w http.ResponseWriter, r *http.Request, retry bool) {
+	// These commands accept neither parameters nor a JSON body.
+	if r.URL.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "this command takes no query parameters")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 16 KiB")
+		} else {
+			writeError(w, http.StatusBadRequest, "cannot read request body")
+		}
+		return
+	}
+	if len(body) != 0 {
+		writeError(w, http.StatusBadRequest, "this command takes no request body")
+		return
+	}
+	var updated task.Task
+	var status int
+	if retry {
+		updated, err = h.service.Retry(r.Context(), r.PathValue("id"))
+		status = http.StatusAccepted
+	} else {
+		updated, err = h.service.Cancel(r.Context(), r.PathValue("id"))
+		status = http.StatusOK
+	}
+	if err != nil {
+		h.serviceError(w, r, err)
+		return
+	}
+	if retry {
+		w.Header().Set("Location", "/api/v1/tasks/"+updated.ID)
+	}
+	writeJSON(w, status, updated)
+}
+
 func urlQuery(r *http.Request) (task.ListOptions, error) {
 	values, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -136,6 +187,8 @@ func (h *Handler) serviceError(w http.ResponseWriter, r *http.Request, err error
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, task.ErrNotFound):
 		writeError(w, http.StatusNotFound, "task not found")
+	case errors.Is(err, task.ErrConflict):
+		writeError(w, http.StatusConflict, "task state does not allow this operation")
 	case errors.Is(err, task.ErrCapacity):
 		writeError(w, http.StatusServiceUnavailable, "task capacity reached")
 	case errors.Is(err, context.Canceled):

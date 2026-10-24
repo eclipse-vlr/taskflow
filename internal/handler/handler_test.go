@@ -168,6 +168,14 @@ func TestRoutesAndCapacity(t *testing.T) {
 
 type failingService struct{}
 
+func (failingService) Retry(context.Context, string) (task.Task, error) {
+	return task.Task{}, errors.New("database unavailable")
+}
+
+func (failingService) Cancel(context.Context, string) (task.Task, error) {
+	return task.Task{}, errors.New("database unavailable")
+}
+
 func (failingService) Create(context.Context, task.CreateInput) (task.Task, error) {
 	return task.Task{}, errors.New("password=secret")
 }
