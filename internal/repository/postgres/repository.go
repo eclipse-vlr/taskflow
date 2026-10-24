@@ -74,7 +74,7 @@ const columns = `t.id::text, t.type, t.payload, t.status, t.attempts, t.max_atte
 	t.created_at, t.updated_at, t.started_at, t.finished_at, t.result, t.last_error`
 
 func (r *Repository) Get(ctx context.Context, id string) (task.Task, error) {
-	if len(id) != 36 {
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
 		return task.Task{}, task.ErrNotFound
 	}
 	var uuid pgtype.UUID
