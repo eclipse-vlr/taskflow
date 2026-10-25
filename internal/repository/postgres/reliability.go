@@ -18,19 +18,26 @@ func validID(id string) bool {
 	return uuid.Scan(id) == nil
 }
 
-// RecoverExpired never reclaims a running task while its execution lease is live.
-// Conditional updates serialize with Finish and with other recovery processes.
+// RecoverExpired handles at most 100 tasks without waiting for locked rows.
+// Row locks serialize recovery with Finish and other recovery processes.
+// Live leases are never reclaimed; skipped tasks wait for the next poll.
 func (r *Repository) RecoverExpired(ctx context.Context) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	updated, err := r.pool.Exec(ctx, `UPDATE tasks SET
+	updated, err := r.pool.Exec(ctx, `WITH candidates AS (
+		SELECT id FROM tasks
+		WHERE (status = 'running' AND lease_expires_at <= clock_timestamp())
+		OR (status = 'pending' AND attempts >= max_attempts)
+		ORDER BY id
+		FOR UPDATE SKIP LOCKED LIMIT 100
+	)
+	UPDATE tasks SET
 		status = CASE WHEN attempts < max_attempts THEN 'pending' ELSE 'failed' END,
 		next_run_at = CASE WHEN attempts < max_attempts THEN clock_timestamp() ELSE NULL END,
 		finished_at = CASE WHEN attempts < max_attempts THEN NULL ELSE clock_timestamp() END,
 		last_error = 'execution interrupted; attempt budget exhausted or lease expired',
 		result = NULL, execution_id = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
-		WHERE (status = 'running' AND lease_expires_at <= clock_timestamp())
-		OR (status = 'pending' AND attempts >= max_attempts)`)
+		WHERE id IN (SELECT id FROM candidates)`)
 	return updated.RowsAffected(), operationError(ctx, "recover tasks", err)
 }
 
