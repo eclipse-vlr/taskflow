@@ -32,7 +32,8 @@ Go 1.26 или новее, `net/http`, `encoding/json`, `log/slog`, PostgreSQL 1
 Нужен запущенный Docker Desktop с Linux-контейнерами. В Windows PowerShell:
 
 ```powershell
-Set-Location C:\dev\taskflow
+git clone https://github.com/eclipse-vlr/taskflow.git
+Set-Location taskflow
 Copy-Item .env.example .env
 docker compose up -d --wait postgres
 docker compose run --rm migrate
@@ -60,7 +61,7 @@ go run ./cmd/api
 
 В Linux/macOS: `DATABASE_URL='postgres://taskflow:taskflow_dev@127.0.0.1:55432/taskflow?sslmode=disable' go run ./cmd/api`. Go-приложение читает окружение процесса, **не загружает `.env` автоматически**.
 
-На текущем Windows-компьютере политика управления приложениями блокирует некоторые сгенерированные `.exe`. Поэтому основной проверенный способ запуска и интеграционных проверок здесь — Docker. Образ API запускает приложение от непривилегированного пользователя.
+Образ API запускает приложение от непривилегированного пользователя.
 
 ## Настройки окружения
 
@@ -189,7 +190,7 @@ docker compose run --rm --build test
 
 Тестовый образ содержит C-компилятор для `-race`. Интеграционные тесты создают случайную схему на каждый тест и удаляют только её. Основная таблица приложения не очищается; для проверок всё равно рекомендуется одноразовая локальная БД.
 
-Запуск через Go в среде, где разрешены сгенерированные программы:
+Интеграционные тесты через Go:
 
 ```powershell
 $env:TEST_DATABASE_URL = 'postgres://taskflow:taskflow_dev@127.0.0.1:55432/taskflow?sslmode=disable'
